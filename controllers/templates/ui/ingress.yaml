@@ -1,0 +1,18 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  labels:
+    l6p-app: kun-ui
+  name: kun-ui
+spec:
+  rules:
+    - host: ""
+      http:
+        paths:
+          - backend:
+              service:
+                name: kun-ui
+                port:
+                  number: 80
+            path: "/"
+            pathType: Prefix

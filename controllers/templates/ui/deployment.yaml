@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    l6p-app: kun-ui
+  name: kun-ui
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      l6p-app: kun-ui
+  template:
+    metadata:
+      labels:
+        l6p-app: kun-ui
+    spec:
+      containers:
+        - name: ui
+          image: ""
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+      serviceAccountName: kun-ui
+      terminationGracePeriodSeconds: 10

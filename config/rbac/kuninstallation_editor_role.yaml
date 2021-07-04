@@ -1,0 +1,24 @@
+# permissions for end users to edit kuninstallations.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kuninstallation-editor-role
+rules:
+  - apiGroups:
+      - l6p.io
+    resources:
+      - kuninstallations
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - l6p.io
+    resources:
+      - kuninstallations/status
+    verbs:
+      - get
