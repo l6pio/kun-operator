@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/go-logr/logr"
 	apps "k8s.io/api/apps/v1"
@@ -40,6 +42,19 @@ import (
 	"time"
 )
 
+type PodEventType int
+
+const (
+	PodCreate PodEventType = 1
+	PodDelete PodEventType = 0
+)
+
+type PodEvent struct {
+	Type      PodEventType
+	Timestamp int64
+	Image     string
+}
+
 const KunApi = "kun-api"
 const KunUI = "kun-ui"
 
@@ -48,7 +63,7 @@ var ServerNamespaces = make([]string, 0)
 var ServerImage = ""
 var UIImage = ""
 
-var PodCreateMessageChannel = make(chan string, 10000)
+var PodEventChannel = make(chan PodEvent, 10000)
 
 //go:embed templates/server/service-account.yaml
 var ServerServiceAccountTemplate string
@@ -110,53 +125,30 @@ type EnqueueRequestForPod struct {
 
 func (e EnqueueRequestForPod) Create(event event.CreateEvent, _ workqueue.RateLimitingInterface) {
 	pod := event.Object.(*core.Pod)
-	if StartTime.After(pod.CreationTimestamp.Time) {
-		return
-	}
-
 	for _, c := range pod.Spec.Containers {
 		if c.Image == ServerImage || c.Image == UIImage {
 			continue
 		}
 		e.Logger.Info(fmt.Sprintf("image '%s' is used to create pod '%s'", c.Image, pod.Name))
-		PodCreateMessageChannel <- c.Image
+		PodEventChannel <- PodEvent{
+			Type:      PodCreate,
+			Timestamp: time.Now().Unix(),
+			Image:     c.Image,
+		}
 	}
 }
 
-func PodCreateMessageProcessor(logger logr.Logger) {
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	sendRequest := func(namespace string, image string) {
-		req, err := http.NewRequest(
-			"POST",
-			fmt.Sprintf("http://kun-api.%s/api/v1/img/up", namespace),
-			bytes.NewBuffer([]byte(fmt.Sprintf(`{"image":"%s"}`, image))),
-		)
-		if err != nil {
-			logger.Error(err, "failed to create http request")
-			return
+func (e EnqueueRequestForPod) Delete(event event.DeleteEvent, _ workqueue.RateLimitingInterface) {
+	pod := event.Object.(*core.Pod)
+	for _, c := range pod.Spec.Containers {
+		if c.Image == ServerImage || c.Image == UIImage {
+			continue
 		}
-
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			logger.Error(err, "failed to send http request")
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			logger.Error(err, "API invocation failed")
-			return
-		}
-	}
-
-	for {
-		image := <-PodCreateMessageChannel
-		for _, namespace := range ServerNamespaces {
-			sendRequest(namespace, image)
+		e.Logger.Info(fmt.Sprintf("the pod '%s' using image '%s' has been removed", c.Image, pod.Name))
+		PodEventChannel <- PodEvent{
+			Type:      PodDelete,
+			Timestamp: time.Now().Unix(),
+			Image:     c.Image,
 		}
 	}
 }
@@ -164,10 +156,60 @@ func PodCreateMessageProcessor(logger logr.Logger) {
 func (e EnqueueRequestForPod) Update(event.UpdateEvent, workqueue.RateLimitingInterface) {
 }
 
-func (e EnqueueRequestForPod) Delete(event.DeleteEvent, workqueue.RateLimitingInterface) {
+func (e EnqueueRequestForPod) Generic(event.GenericEvent, workqueue.RateLimitingInterface) {
 }
 
-func (e EnqueueRequestForPod) Generic(event.GenericEvent, workqueue.RateLimitingInterface) {
+func PodEventProcessor(logger logr.Logger) {
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	for {
+		podEvent := <-PodEventChannel
+		for _, namespace := range ServerNamespaces {
+			data, err := json.Marshal(struct {
+				Timestamp int64  `json:"timestamp"`
+				Image     string `json:"image"`
+				Status    int    `json:"status"`
+			}{
+				Timestamp: podEvent.Timestamp,
+				Image:     podEvent.Image,
+				Status:    int(podEvent.Type),
+			})
+			if err != nil {
+				logger.Error(err, "failed to marshal data")
+				return
+			}
+
+			req, err := http.NewRequest(
+				"POST",
+				fmt.Sprintf("http://kun-api.%s/api/v1/image/status", namespace),
+				bytes.NewBuffer(data),
+			)
+			if err != nil {
+				logger.Error(err, "failed to create http request")
+				return
+			}
+
+			if err := DoRequest(httpClient, req); err != nil {
+				logger.Error(err, "failed to call http request")
+			}
+		}
+	}
+}
+
+func DoRequest(client *http.Client, req *http.Request) error {
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return errors.New("response status is not 200")
+	}
+	return nil
 }
 
 type EnqueueRequestForKunInstallation struct {
@@ -257,7 +299,7 @@ func (e EnqueueRequestForKunInstallation) Generic(event.GenericEvent, workqueue.
 // SetupWithManager sets up the controller with the Manager.
 func (r *KunInstallationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	logger := logf.Log.WithName("kuninstallation-controller")
-	go PodCreateMessageProcessor(logger)
+	go PodEventProcessor(logger)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kunapi.KunInstallation{}).
@@ -285,8 +327,16 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 		install.Spec.Server.Replicas, ServerImage, &install.Spec.Server.Resources,
 		[]core.EnvVar{
 			{
-				Name:  "CLICKHOUSE_ADDR",
-				Value: install.Spec.Clickhouse.Addr,
+				Name:  "MONGODB_ADDR",
+				Value: install.Spec.Mongodb.Addr,
+			},
+			{
+				Name:  "MONGODB_USER",
+				Value: install.Spec.Mongodb.User,
+			},
+			{
+				Name:  "MONGODB_PASS",
+				Value: install.Spec.Mongodb.Pass,
 			},
 		},
 	); err != nil {

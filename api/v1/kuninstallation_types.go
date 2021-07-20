@@ -28,14 +28,16 @@ import (
 type KunInstallationSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Hub        string                    `json:"hub,omitempty"`
-	Clickhouse KunInstallationClickhouse `json:"clickhouse,omitempty"`
-	Server     KunInstallationServer     `json:"server,omitempty"`
-	UI         KunInstallationUI         `json:"ui,omitempty"`
+	Hub     string                 `json:"hub,omitempty"`
+	Mongodb KunInstallationMongodb `json:"mongodb,omitempty"`
+	Server  KunInstallationServer  `json:"server,omitempty"`
+	UI      KunInstallationUI      `json:"ui,omitempty"`
 }
 
-type KunInstallationClickhouse struct {
+type KunInstallationMongodb struct {
 	Addr string `json:"addr,omitempty"`
+	User string `json:"user,omitempty"`
+	Pass string `json:"pass,omitempty"`
 }
 
 type KunInstallationServer struct {

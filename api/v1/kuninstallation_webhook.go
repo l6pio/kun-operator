@@ -90,10 +90,10 @@ func (r *KunInstallation) ValidateDelete() error {
 
 func (r *KunInstallation) ValidateInstallation() error {
 	var allErrs field.ErrorList
-	if r.Spec.Clickhouse.Addr == "" {
+	if r.Spec.Mongodb.Addr == "" {
 		allErrs = append(allErrs, field.Invalid(
-			field.NewPath("spec").Child("clickhouse").Child("addr"),
-			r.Spec.Clickhouse.Addr,
+			field.NewPath("spec").Child("mongodb").Child("addr"),
+			r.Spec.Mongodb.Addr,
 			"cannot be empty",
 		))
 	}

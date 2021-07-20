@@ -4,8 +4,10 @@ metadata:
   name: sample
 spec:
   hub: localhost:32000
-  clickhouse:
-    addr: "tcp://clickhouse-kun.default:9000?username=user&password=123456&debug=true"
+  mongodb:
+    addr: "mongodb.default.svc.cluster.local:27017"
+    user: "root"
+    pass: "rootpassword"
   server:
     replicas: 1
     port: 80
