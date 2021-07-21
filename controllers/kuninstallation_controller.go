@@ -159,6 +159,7 @@ func (e EnqueueRequestForPod) Update(event.UpdateEvent, workqueue.RateLimitingIn
 func (e EnqueueRequestForPod) Generic(event.GenericEvent, workqueue.RateLimitingInterface) {
 }
 
+// PodEventProcessor Get the events of the POD in the queue and send requests to the API Server.
 func PodEventProcessor(logger logr.Logger) {
 	httpClient := &http.Client{
 		Timeout: 10 * time.Second,
@@ -218,8 +219,9 @@ type EnqueueRequestForKunInstallation struct {
 }
 
 func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, _ workqueue.RateLimitingInterface) {
+	// The namespaces where the CRD is installed are saved for the purpose of
+	// sending requests to the API Server in those namespaces.
 	install := createEvent.Object.(*kunapi.KunInstallation)
-
 	exist := false
 	for _, namespace := range ServerNamespaces {
 		if namespace == install.Namespace {
@@ -231,6 +233,7 @@ func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, 
 		ServerNamespaces = append(ServerNamespaces, install.Namespace)
 	}
 
+	// Ignore when the CRD is created before the operator's start time.
 	if StartTime.After(install.CreationTimestamp.Time) {
 		return
 	}
@@ -272,8 +275,8 @@ func (e EnqueueRequestForKunInstallation) Update(updateEvent event.UpdateEvent, 
 }
 
 func (e EnqueueRequestForKunInstallation) Delete(deleteEvent event.DeleteEvent, _ workqueue.RateLimitingInterface) {
+	// Delete the saved namespace when uninstalling CRD.
 	install := deleteEvent.Object.(*kunapi.KunInstallation)
-
 	tmp := make([]string, 0)
 	for _, namespace := range ServerNamespaces {
 		if namespace != install.Namespace {
