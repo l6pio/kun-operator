@@ -53,12 +53,14 @@ type PodEvent struct {
 	Type      PodEventType
 	Timestamp int64
 	Image     string
+	PodName   string
 }
 
 const KunApi = "kun-api"
 const KunUI = "kun-ui"
 
-var StartTime = time.Now()
+var WaitUntilStarted = make(chan struct{})
+var ExistedCrdNames = make([]string, 0)
 var ServerNamespaces = make([]string, 0)
 var ServerImage = ""
 var UIImage = ""
@@ -129,11 +131,11 @@ func (e EnqueueRequestForPod) Create(event event.CreateEvent, _ workqueue.RateLi
 		if c.Image == ServerImage || c.Image == UIImage {
 			continue
 		}
-		e.Logger.Info(fmt.Sprintf("image '%s' is used to create pod '%s'", c.Image, pod.Name))
 		PodEventChannel <- PodEvent{
 			Type:      PodCreate,
 			Timestamp: time.Now().Unix(),
 			Image:     c.Image,
+			PodName:   pod.Name,
 		}
 	}
 }
@@ -144,11 +146,11 @@ func (e EnqueueRequestForPod) Delete(event event.DeleteEvent, _ workqueue.RateLi
 		if c.Image == ServerImage || c.Image == UIImage {
 			continue
 		}
-		e.Logger.Info(fmt.Sprintf("the pod '%s' using image '%s' has been removed", c.Image, pod.Name))
 		PodEventChannel <- PodEvent{
 			Type:      PodDelete,
 			Timestamp: time.Now().Unix(),
 			Image:     c.Image,
+			PodName:   pod.Name,
 		}
 	}
 }
@@ -165,6 +167,7 @@ func PodEventProcessor(logger logr.Logger) {
 		Timeout: 10 * time.Second,
 	}
 
+	<-WaitUntilStarted
 	for {
 		podEvent := <-PodEventChannel
 		for _, namespace := range ServerNamespaces {
@@ -180,6 +183,12 @@ func PodEventProcessor(logger logr.Logger) {
 			if err != nil {
 				logger.Error(err, "failed to marshal data")
 				return
+			}
+
+			if podEvent.Type == PodCreate {
+				logger.Info(fmt.Sprintf("image '%s' is used to create pod '%s'", podEvent.Image, podEvent.PodName))
+			} else {
+				logger.Info(fmt.Sprintf("the pod '%s' using image '%s' has been removed", podEvent.Image, podEvent.PodName))
 			}
 
 			req, err := http.NewRequest(
@@ -219,23 +228,14 @@ type EnqueueRequestForKunInstallation struct {
 }
 
 func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, _ workqueue.RateLimitingInterface) {
-	// The namespaces where the CRD is installed are saved for the purpose of
-	// sending requests to the API Server in those namespaces.
 	install := createEvent.Object.(*kunapi.KunInstallation)
-	exist := false
-	for _, namespace := range ServerNamespaces {
-		if namespace == install.Namespace {
-			exist = true
-			break
-		}
-	}
-	if !exist {
-		ServerNamespaces = append(ServerNamespaces, install.Namespace)
-	}
+	AddServerNamespace(install.Namespace)
 
-	// Ignore when the CRD is created before the operator's start time.
-	if StartTime.After(install.CreationTimestamp.Time) {
-		return
+	// Ignore CRDs that already exist when the controller starts.
+	for _, name := range ExistedCrdNames {
+		if name == install.Name {
+			return
+		}
 	}
 
 	if err := DeployUI(e.Client, context.Background(), install); err != nil {
@@ -275,15 +275,8 @@ func (e EnqueueRequestForKunInstallation) Update(updateEvent event.UpdateEvent, 
 }
 
 func (e EnqueueRequestForKunInstallation) Delete(deleteEvent event.DeleteEvent, _ workqueue.RateLimitingInterface) {
-	// Delete the saved namespace when uninstalling CRD.
 	install := deleteEvent.Object.(*kunapi.KunInstallation)
-	tmp := make([]string, 0)
-	for _, namespace := range ServerNamespaces {
-		if namespace != install.Namespace {
-			tmp = append(tmp, namespace)
-		}
-	}
-	ServerNamespaces = tmp
+	DeleteServerNamespace(install.Namespace)
 
 	if err := UndeployUI(e.Client, context.Background(), install.Namespace); err != nil {
 		e.Logger.Error(err, "failed to undeploy Kun UI")
@@ -297,6 +290,32 @@ func (e EnqueueRequestForKunInstallation) Delete(deleteEvent event.DeleteEvent, 
 }
 
 func (e EnqueueRequestForKunInstallation) Generic(event.GenericEvent, workqueue.RateLimitingInterface) {
+}
+
+func AddServerNamespace(namespace string) {
+	// The namespaces where the CRD is installed are saved for the purpose of
+	// sending requests to the API Server in those namespaces.
+	exist := false
+	for _, ns := range ServerNamespaces {
+		if ns == namespace {
+			exist = true
+			break
+		}
+	}
+	if !exist {
+		ServerNamespaces = append(ServerNamespaces, namespace)
+	}
+}
+
+func DeleteServerNamespace(namespace string) {
+	// Delete the saved namespace when uninstalling CRD.
+	tmp := make([]string, 0)
+	for _, ns := range ServerNamespaces {
+		if ns != namespace {
+			tmp = append(tmp, namespace)
+		}
+	}
+	ServerNamespaces = tmp
 }
 
 // SetupWithManager sets up the controller with the Manager.
