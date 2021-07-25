@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -45,6 +47,25 @@ func init() {
 
 	utilruntime.Must(l6piov1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
+}
+
+type Startup struct {
+	mgr manager.Manager
+}
+
+func (s Startup) Start(ctx context.Context) (err error) {
+	var installs l6piov1.KunInstallationList
+	if err := s.mgr.GetClient().List(context.Background(), &installs); err != nil {
+		setupLog.Error(err, "unable to get CRD list")
+		os.Exit(1)
+	}
+	for _, install := range installs.Items {
+		controllers.ServerNamespaces = append(controllers.ServerNamespaces, install.Namespace)
+		controllers.ExistedCrdNames = append(controllers.ExistedCrdNames, install.Name)
+	}
+	controllers.WaitUntilStarted <- struct{}{}
+	ctx.Done()
+	return nil
 }
 
 func main() {
@@ -74,6 +95,14 @@ func main() {
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	err = mgr.Add(Startup{
+		mgr: mgr,
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to do pre-start preparation")
 		os.Exit(1)
 	}
 
