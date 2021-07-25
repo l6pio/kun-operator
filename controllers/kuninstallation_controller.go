@@ -17,77 +17,27 @@ limitations under the License.
 package controllers
 
 import (
-	"bytes"
 	"context"
 	_ "embed"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/go-logr/logr"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
-	networking "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
 	kunapi "l6p.io/KunOperator/api/v1"
-	"net/http"
+	"l6p.io/KunOperator/controllers/templates"
 	"path"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-	"time"
 )
-
-type PodEventType int
-
-const (
-	PodCreate PodEventType = 1
-	PodDelete PodEventType = 0
-)
-
-type PodEvent struct {
-	Type      PodEventType
-	Timestamp int64
-	Image     string
-}
 
 const KunApi = "kun-api"
 const KunUI = "kun-ui"
-
-var StartTime = time.Now()
-var ServerNamespaces = make([]string, 0)
-var ServerImage = ""
-var UIImage = ""
-
-var PodEventChannel = make(chan PodEvent, 10000)
-
-//go:embed templates/server/service-account.yaml
-var ServerServiceAccountTemplate string
-
-//go:embed templates/server/deployment.yaml
-var ServerDeployTemplate string
-
-//go:embed templates/server/service.yaml
-var ServerServiceTemplate string
-
-//go:embed templates/server/ingress.yaml
-var ServerIngressTemplate string
-
-//go:embed templates/ui/service-account.yaml
-var UIServiceAccountTemplate string
-
-//go:embed templates/ui/deployment.yaml
-var UIDeployTemplate string
-
-//go:embed templates/ui/service.yaml
-var UIServiceTemplate string
-
-//go:embed templates/ui/ingress.yaml
-var UIIngressTemplate string
 
 // KunInstallationReconciler reconciles a KunInstallation object
 type KunInstallationReconciler struct {
@@ -99,10 +49,13 @@ type KunInstallationReconciler struct {
 //+kubebuilder:rbac:groups=l6p.io,resources=kuninstallations/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=l6p.io,resources=kuninstallations/finalizers,verbs=update
 
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="networking.k8s.io",resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -117,135 +70,45 @@ func (r *KunInstallationReconciler) Reconcile(_ context.Context, _ ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
-
-type EnqueueRequestForPod struct {
-	Logger logr.Logger
-}
-
-func (e EnqueueRequestForPod) Create(event event.CreateEvent, _ workqueue.RateLimitingInterface) {
-	pod := event.Object.(*core.Pod)
-	for _, c := range pod.Spec.Containers {
-		if c.Image == ServerImage || c.Image == UIImage {
-			continue
-		}
-		e.Logger.Info(fmt.Sprintf("image '%s' is used to create pod '%s'", c.Image, pod.Name))
-		PodEventChannel <- PodEvent{
-			Type:      PodCreate,
-			Timestamp: time.Now().Unix(),
-			Image:     c.Image,
-		}
-	}
-}
-
-func (e EnqueueRequestForPod) Delete(event event.DeleteEvent, _ workqueue.RateLimitingInterface) {
-	pod := event.Object.(*core.Pod)
-	for _, c := range pod.Spec.Containers {
-		if c.Image == ServerImage || c.Image == UIImage {
-			continue
-		}
-		e.Logger.Info(fmt.Sprintf("the pod '%s' using image '%s' has been removed", c.Image, pod.Name))
-		PodEventChannel <- PodEvent{
-			Type:      PodDelete,
-			Timestamp: time.Now().Unix(),
-			Image:     c.Image,
-		}
-	}
-}
-
-func (e EnqueueRequestForPod) Update(event.UpdateEvent, workqueue.RateLimitingInterface) {
-}
-
-func (e EnqueueRequestForPod) Generic(event.GenericEvent, workqueue.RateLimitingInterface) {
-}
-
-// PodEventProcessor Get the events of the POD in the queue and send requests to the API Server.
-func PodEventProcessor(logger logr.Logger) {
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	for {
-		podEvent := <-PodEventChannel
-		for _, namespace := range ServerNamespaces {
-			data, err := json.Marshal(struct {
-				Timestamp int64  `json:"timestamp"`
-				Image     string `json:"image"`
-				Status    int    `json:"status"`
-			}{
-				Timestamp: podEvent.Timestamp,
-				Image:     podEvent.Image,
-				Status:    int(podEvent.Type),
-			})
-			if err != nil {
-				logger.Error(err, "failed to marshal data")
-				return
-			}
-
-			req, err := http.NewRequest(
-				"POST",
-				fmt.Sprintf("http://kun-api.%s/api/v1/image/status", namespace),
-				bytes.NewBuffer(data),
-			)
-			if err != nil {
-				logger.Error(err, "failed to create http request")
-				return
-			}
-
-			if err := DoRequest(httpClient, req); err != nil {
-				logger.Error(err, "failed to call http request")
-			}
-		}
-	}
-}
-
-func DoRequest(client *http.Client, req *http.Request) error {
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return errors.New("response status is not 200")
-	}
-	return nil
-}
-
 type EnqueueRequestForKunInstallation struct {
 	Logger logr.Logger
 	client.Client
 }
 
 func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, _ workqueue.RateLimitingInterface) {
-	// The namespaces where the CRD is installed are saved for the purpose of
-	// sending requests to the API Server in those namespaces.
 	install := createEvent.Object.(*kunapi.KunInstallation)
-	exist := false
-	for _, namespace := range ServerNamespaces {
-		if namespace == install.Namespace {
-			exist = true
-			break
+
+	var deploys apps.DeploymentList
+	if err := e.Client.List(context.TODO(), &deploys,
+		&client.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labels.Set{"l6p-app": KunUI}),
+			Namespace:     install.Namespace,
+		},
+	); err != nil {
+		e.Logger.Error(err, "failed to get Deployments")
+		return
+	}
+	if len(deploys.Items) == 0 {
+		if err := DeployUI(e.Client, context.Background(), install); err != nil {
+			e.Logger.Error(err, "failed to deploy Kun UI")
+			return
 		}
 	}
-	if !exist {
-		ServerNamespaces = append(ServerNamespaces, install.Namespace)
-	}
 
-	// Ignore when the CRD is created before the operator's start time.
-	if StartTime.After(install.CreationTimestamp.Time) {
+	if err := e.Client.List(context.TODO(), &deploys,
+		&client.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labels.Set{"l6p-app": KunApi}),
+			Namespace:     install.Namespace,
+		},
+	); err != nil {
+		e.Logger.Error(err, "failed to get Deployments")
 		return
 	}
-
-	if err := DeployUI(e.Client, context.Background(), install); err != nil {
-		e.Logger.Error(err, "failed to deploy Kun UI")
-		return
-	}
-
-	if err := DeployServer(e.Client, context.Background(), install); err != nil {
-		e.Logger.Error(err, "failed to deploy Kun server")
-		return
+	if len(deploys.Items) == 0 {
+		if err := DeployServer(e.Client, context.Background(), install); err != nil {
+			e.Logger.Error(err, "failed to deploy Kun server")
+			return
+		}
 	}
 }
 
@@ -275,15 +138,7 @@ func (e EnqueueRequestForKunInstallation) Update(updateEvent event.UpdateEvent, 
 }
 
 func (e EnqueueRequestForKunInstallation) Delete(deleteEvent event.DeleteEvent, _ workqueue.RateLimitingInterface) {
-	// Delete the saved namespace when uninstalling CRD.
 	install := deleteEvent.Object.(*kunapi.KunInstallation)
-	tmp := make([]string, 0)
-	for _, namespace := range ServerNamespaces {
-		if namespace != install.Namespace {
-			tmp = append(tmp, namespace)
-		}
-	}
-	ServerNamespaces = tmp
 
 	if err := UndeployUI(e.Client, context.Background(), install.Namespace); err != nil {
 		e.Logger.Error(err, "failed to undeploy Kun UI")
@@ -302,7 +157,6 @@ func (e EnqueueRequestForKunInstallation) Generic(event.GenericEvent, workqueue.
 // SetupWithManager sets up the controller with the Manager.
 func (r *KunInstallationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	logger := logf.Log.WithName("kuninstallation-controller")
-	go PodEventProcessor(logger)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kunapi.KunInstallation{}).
@@ -310,24 +164,33 @@ func (r *KunInstallationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&source.Kind{Type: &kunapi.KunInstallation{}},
 			&EnqueueRequestForKunInstallation{Logger: logger, Client: r.Client},
 		).
-		Watches(
-			&source.Kind{Type: &core.Pod{}},
-			&EnqueueRequestForPod{Logger: logger},
-		).
 		Complete(r)
 }
 
 func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInstallation) error {
-	if err := CreateServiceAccount(
-		c, ctx, KunApi, install.Namespace, ServerServiceAccountTemplate,
+	if err := templates.CreateServiceAccount(
+		c, ctx, KunApi, install.Namespace, templates.ServerServiceAccountTemplate,
 	); err != nil {
 		return err
 	}
 
-	ServerImage = path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunApi))
-	if err := CreateDeployment(
-		c, ctx, KunApi, install.Namespace, ServerDeployTemplate,
-		install.Spec.Server.Replicas, ServerImage, &install.Spec.Server.Resources,
+	if err := templates.CreateClusterRole(
+		c, ctx, KunApi, templates.ServerClusterRoleTemplate,
+	); err != nil {
+		return err
+	}
+
+	if err := templates.CreateClusterRoleBinding(
+		c, ctx, KunApi, install.Namespace, templates.ServerClusterRoleBindingTemplate,
+	); err != nil {
+		return err
+	}
+
+	if err := templates.CreateDeployment(
+		c, ctx, KunApi, install.Namespace, templates.ServerDeployTemplate,
+		install.Spec.Server.Replicas,
+		path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunApi)),
+		&install.Spec.Server.Resources,
 		[]core.EnvVar{
 			{
 				Name:  "MONGODB_ADDR",
@@ -346,16 +209,16 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 		return err
 	}
 
-	if err := CreateService(
-		c, ctx, KunApi, install.Namespace, ServerServiceTemplate,
+	if err := templates.CreateService(
+		c, ctx, KunApi, install.Namespace, templates.ServerServiceTemplate,
 		*install.Spec.Server.Port,
 	); err != nil {
 		return err
 	}
 
 	if install.Spec.Server.Ingress.Enabled {
-		if err := CreateIngress(
-			c, ctx, KunApi, install.Namespace, ServerIngressTemplate,
+		if err := templates.CreateIngress(
+			c, ctx, KunApi, install.Namespace, templates.ServerIngressTemplate,
 			install.Spec.Server.Ingress.Host, install.Spec.Server.Ingress.Path, *install.Spec.Server.Port,
 		); err != nil {
 			return err
@@ -365,19 +228,27 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 }
 
 func UndeployServer(c client.Client, ctx context.Context, namespace string) error {
-	if err := DeleteServiceAccount(c, ctx, KunApi, namespace); err != nil {
+	if err := templates.DeleteIngress(c, ctx, KunApi, namespace); err != nil {
 		return err
 	}
 
-	if err := DeleteDeployment(c, ctx, KunApi, namespace); err != nil {
+	if err := templates.DeleteService(c, ctx, KunApi, namespace); err != nil {
 		return err
 	}
 
-	if err := DeleteService(c, ctx, KunApi, namespace); err != nil {
+	if err := templates.DeleteDeployment(c, ctx, KunApi, namespace); err != nil {
 		return err
 	}
 
-	if err := DeleteIngress(c, ctx, KunApi, namespace); err != nil {
+	if err := templates.DeleteClusterRole(c, ctx, KunApi); err != nil {
+		return err
+	}
+
+	if err := templates.DeleteClusterRoleBinding(c, ctx, KunApi); err != nil {
+		return err
+	}
+
+	if err := templates.DeleteServiceAccount(c, ctx, KunApi, namespace); err != nil {
 		return err
 	}
 	return nil
@@ -388,30 +259,32 @@ func DeployUI(c client.Client, ctx context.Context, install *kunapi.KunInstallat
 		return nil
 	}
 
-	if err := CreateServiceAccount(
-		c, ctx, KunUI, install.Namespace, UIServiceAccountTemplate,
+	if err := templates.CreateServiceAccount(
+		c, ctx, KunUI, install.Namespace, templates.UIServiceAccountTemplate,
 	); err != nil {
 		return err
 	}
 
-	UIImage = path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunUI))
-	if err := CreateDeployment(
-		c, ctx, KunUI, install.Namespace, UIDeployTemplate,
-		install.Spec.UI.Replicas, UIImage, &install.Spec.UI.Resources, nil,
+	if err := templates.CreateDeployment(
+		c, ctx, KunUI, install.Namespace, templates.UIDeployTemplate,
+		install.Spec.UI.Replicas,
+		path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunUI)),
+		&install.Spec.UI.Resources,
+		nil,
 	); err != nil {
 		return err
 	}
 
-	if err := CreateService(
-		c, ctx, KunUI, install.Namespace, UIServiceTemplate,
+	if err := templates.CreateService(
+		c, ctx, KunUI, install.Namespace, templates.UIServiceTemplate,
 		*install.Spec.UI.Port,
 	); err != nil {
 		return err
 	}
 
 	if install.Spec.UI.Ingress.Enabled {
-		if err := CreateIngress(
-			c, ctx, KunUI, install.Namespace, UIIngressTemplate,
+		if err := templates.CreateIngress(
+			c, ctx, KunUI, install.Namespace, templates.UIIngressTemplate,
 			install.Spec.UI.Ingress.Host, install.Spec.UI.Ingress.Path, *install.Spec.UI.Port,
 		); err != nil {
 			return err
@@ -421,261 +294,20 @@ func DeployUI(c client.Client, ctx context.Context, install *kunapi.KunInstallat
 }
 
 func UndeployUI(c client.Client, ctx context.Context, namespace string) error {
-	if err := DeleteServiceAccount(c, ctx, KunUI, namespace); err != nil {
+	if err := templates.DeleteServiceAccount(c, ctx, KunUI, namespace); err != nil {
 		return err
 	}
 
-	if err := DeleteDeployment(c, ctx, KunUI, namespace); err != nil {
+	if err := templates.DeleteDeployment(c, ctx, KunUI, namespace); err != nil {
 		return err
 	}
 
-	if err := DeleteService(c, ctx, KunUI, namespace); err != nil {
+	if err := templates.DeleteService(c, ctx, KunUI, namespace); err != nil {
 		return err
 	}
 
-	if err := DeleteIngress(c, ctx, KunUI, namespace); err != nil {
+	if err := templates.DeleteIngress(c, ctx, KunUI, namespace); err != nil {
 		return err
-	}
-	return nil
-}
-
-func GetServiceAccount(c client.Client, ctx context.Context, name string, namespace string) (*core.ServiceAccount, error) {
-	var serviceAccounts core.ServiceAccountList
-	if err := c.List(ctx, &serviceAccounts, client.InNamespace(namespace)); err != nil {
-		return nil, err
-	}
-
-	if len(serviceAccounts.Items) > 0 {
-		for _, sa := range serviceAccounts.Items {
-			if sa.Name == name {
-				return &sa, nil
-			}
-		}
-	}
-	return nil, nil
-}
-
-func CreateServiceAccount(c client.Client, ctx context.Context, name string, namespace string, template string) error {
-	serviceAccount, err := GetServiceAccount(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if serviceAccount == nil {
-		decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDecoder()
-
-		var newServiceAccount core.ServiceAccount
-		if err := runtime.DecodeInto(decoder, []byte(template), &newServiceAccount); err != nil {
-			return err
-		}
-		newServiceAccount.Name = name
-		newServiceAccount.Namespace = namespace
-
-		if err := c.Create(ctx, &newServiceAccount); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func DeleteServiceAccount(c client.Client, ctx context.Context, name string, namespace string) error {
-	serviceAccount, err := GetServiceAccount(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if serviceAccount != nil {
-		if err := c.Delete(ctx, serviceAccount); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func GetDeployment(c client.Client, ctx context.Context, name string, namespace string) (*apps.Deployment, error) {
-	var deployments apps.DeploymentList
-	if err := c.List(ctx, &deployments, client.InNamespace(namespace)); err != nil {
-		return nil, err
-	}
-
-	if len(deployments.Items) > 0 {
-		for _, deploy := range deployments.Items {
-			if deploy.Name == name {
-				return &deploy, nil
-			}
-		}
-	}
-	return nil, nil
-}
-
-func CreateDeployment(
-	c client.Client, ctx context.Context, name string, namespace string,
-	template string, replicas *int32, image string,
-	resources *core.ResourceRequirements, env []core.EnvVar,
-) error {
-	deploy, err := GetDeployment(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if deploy == nil {
-		decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDecoder()
-
-		var newDeploy apps.Deployment
-		if err := runtime.DecodeInto(decoder, []byte(template), &newDeploy); err != nil {
-			return err
-		}
-
-		newDeploy.Name = name
-		newDeploy.Namespace = namespace
-		newDeploy.Spec.Replicas = replicas
-
-		container := &newDeploy.Spec.Template.Spec.Containers[0]
-		container.Image = image
-		container.Resources = *resources
-
-		if env != nil {
-			container.Env = env
-		}
-
-		if err := c.Create(ctx, &newDeploy); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func DeleteDeployment(c client.Client, ctx context.Context, name string, namespace string) error {
-	deploy, err := GetDeployment(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if deploy != nil {
-		if err := c.Delete(ctx, deploy); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func GetService(c client.Client, ctx context.Context, name string, namespace string) (*core.Service, error) {
-	var services core.ServiceList
-	if err := c.List(ctx, &services, client.InNamespace(namespace)); err != nil {
-		return nil, err
-	}
-
-	if len(services.Items) > 0 {
-		for _, service := range services.Items {
-			if service.Name == name {
-				return &service, nil
-			}
-		}
-	}
-	return nil, nil
-}
-
-func CreateService(
-	c client.Client, ctx context.Context, name string, namespace string,
-	template string, port int32,
-) error {
-	service, err := GetService(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if service == nil {
-		decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDecoder()
-
-		var newService core.Service
-		if err := runtime.DecodeInto(decoder, []byte(template), &newService); err != nil {
-			return err
-		}
-		newService.Name = name
-		newService.Namespace = namespace
-		newService.Spec.Ports[0].Port = port
-
-		if err := c.Create(ctx, &newService); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func DeleteService(c client.Client, ctx context.Context, name string, namespace string) error {
-	service, err := GetService(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if service != nil {
-		if err := c.Delete(ctx, service); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func GetIngress(c client.Client, ctx context.Context, name string, namespace string) (*networking.Ingress, error) {
-	var ingresses networking.IngressList
-	if err := c.List(ctx, &ingresses, client.InNamespace(namespace)); err != nil {
-		return nil, err
-	}
-
-	if len(ingresses.Items) > 0 {
-		for _, ingress := range ingresses.Items {
-			if ingress.Name == name {
-				return &ingress, nil
-			}
-		}
-	}
-	return nil, nil
-}
-
-func CreateIngress(
-	c client.Client, ctx context.Context, name string, namespace string,
-	template string, host string, path string, port int32,
-) error {
-	ingress, err := GetIngress(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if ingress == nil {
-		decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDecoder()
-
-		var newIngress networking.Ingress
-		if err := runtime.DecodeInto(decoder, []byte(template), &newIngress); err != nil {
-			return err
-		}
-		newIngress.Name = name
-		newIngress.Namespace = namespace
-
-		pathTypePrefix := networking.PathTypePrefix
-		newIngress.Spec.Rules = []networking.IngressRule{
-			{
-				Host: host,
-				IngressRuleValue: networking.IngressRuleValue{
-					HTTP: &networking.HTTPIngressRuleValue{
-						Paths: []networking.HTTPIngressPath{
-							{
-								Path:     path,
-								PathType: &pathTypePrefix,
-								Backend: networking.IngressBackend{
-									Service: &networking.IngressServiceBackend{
-										Name: name,
-										Port: networking.ServiceBackendPort{
-											Number: port,
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		}
-		if err := c.Create(ctx, &newIngress); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func DeleteIngress(c client.Client, ctx context.Context, name string, namespace string) error {
-	ingress, err := GetIngress(c, ctx, name, namespace)
-	if err != nil {
-		return err
-	} else if ingress != nil {
-		if err := c.Delete(ctx, ingress); err != nil {
-			return err
-		}
 	}
 	return nil
 }
