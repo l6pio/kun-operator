@@ -77,6 +77,7 @@ type EnqueueRequestForKunInstallation struct {
 
 func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, _ workqueue.RateLimitingInterface) {
 	install := createEvent.Object.(*kunapi.KunInstallation)
+
 	var deploys apps.DeploymentList
 	if err := e.Client.List(context.TODO(), &deploys,
 		&client.ListOptions{
@@ -86,7 +87,6 @@ func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, 
 	); err != nil {
 		e.Logger.Error(err, "failed to get Deployments")
 		return
-
 	}
 	if len(deploys.Items) == 0 {
 		if err := DeployUI(e.Client, context.Background(), install); err != nil {
