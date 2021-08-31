@@ -17,22 +17,19 @@ limitations under the License.
 package controllers
 
 import (
-	"bytes"
 	"context"
 	_ "embed"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/go-logr/logr"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
 	kunapi "l6p.io/KunOperator/api/v1"
-	"net/http"
 	"path"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,28 +39,10 @@ import (
 	"time"
 )
 
-type PodEventType int
-
-const (
-	PodCreate PodEventType = 1
-	PodDelete PodEventType = 0
-)
-
-type PodEvent struct {
-	Type      PodEventType
-	Timestamp int64
-	Image     string
-}
+var StartTime = time.Now()
 
 const KunApi = "kun-api"
 const KunUI = "kun-ui"
-
-var StartTime = time.Now()
-var ServerNamespaces = make([]string, 0)
-var ServerImage = ""
-var UIImage = ""
-
-var PodEventChannel = make(chan PodEvent, 10000)
 
 //go:embed templates/server/service-account.yaml
 var ServerServiceAccountTemplate string
@@ -117,120 +96,23 @@ func (r *KunInstallationReconciler) Reconcile(_ context.Context, _ ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
-
-type EnqueueRequestForPod struct {
-	Logger logr.Logger
-}
-
-func (e EnqueueRequestForPod) Create(event event.CreateEvent, _ workqueue.RateLimitingInterface) {
-	pod := event.Object.(*core.Pod)
-	for _, c := range pod.Spec.Containers {
-		if c.Image == ServerImage || c.Image == UIImage {
-			continue
-		}
-		e.Logger.Info(fmt.Sprintf("image '%s' is used to create pod '%s'", c.Image, pod.Name))
-		PodEventChannel <- PodEvent{
-			Type:      PodCreate,
-			Timestamp: time.Now().Unix(),
-			Image:     c.Image,
-		}
-	}
-}
-
-func (e EnqueueRequestForPod) Delete(event event.DeleteEvent, _ workqueue.RateLimitingInterface) {
-	pod := event.Object.(*core.Pod)
-	for _, c := range pod.Spec.Containers {
-		if c.Image == ServerImage || c.Image == UIImage {
-			continue
-		}
-		e.Logger.Info(fmt.Sprintf("the pod '%s' using image '%s' has been removed", c.Image, pod.Name))
-		PodEventChannel <- PodEvent{
-			Type:      PodDelete,
-			Timestamp: time.Now().Unix(),
-			Image:     c.Image,
-		}
-	}
-}
-
-func (e EnqueueRequestForPod) Update(event.UpdateEvent, workqueue.RateLimitingInterface) {
-}
-
-func (e EnqueueRequestForPod) Generic(event.GenericEvent, workqueue.RateLimitingInterface) {
-}
-
-// PodEventProcessor Get the events of the POD in the queue and send requests to the API Server.
-func PodEventProcessor(logger logr.Logger) {
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	for {
-		podEvent := <-PodEventChannel
-		for _, namespace := range ServerNamespaces {
-			data, err := json.Marshal(struct {
-				Timestamp int64  `json:"timestamp"`
-				Image     string `json:"image"`
-				Status    int    `json:"status"`
-			}{
-				Timestamp: podEvent.Timestamp,
-				Image:     podEvent.Image,
-				Status:    int(podEvent.Type),
-			})
-			if err != nil {
-				logger.Error(err, "failed to marshal data")
-				return
-			}
-
-			req, err := http.NewRequest(
-				"POST",
-				fmt.Sprintf("http://kun-api.%s/api/v1/image/status", namespace),
-				bytes.NewBuffer(data),
-			)
-			if err != nil {
-				logger.Error(err, "failed to create http request")
-				return
-			}
-
-			if err := DoRequest(httpClient, req); err != nil {
-				logger.Error(err, "failed to call http request")
-			}
-		}
-	}
-}
-
-func DoRequest(client *http.Client, req *http.Request) error {
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return errors.New("response status is not 200")
-	}
-	return nil
-}
-
 type EnqueueRequestForKunInstallation struct {
 	Logger logr.Logger
 	client.Client
 }
 
 func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, _ workqueue.RateLimitingInterface) {
-	// The namespaces where the CRD is installed are saved for the purpose of
-	// sending requests to the API Server in those namespaces.
 	install := createEvent.Object.(*kunapi.KunInstallation)
-	exist := false
-	for _, namespace := range ServerNamespaces {
-		if namespace == install.Namespace {
-			exist = true
-			break
-		}
-	}
-	if !exist {
-		ServerNamespaces = append(ServerNamespaces, install.Namespace)
+
+	var deploys apps.DeploymentList
+	if err := e.Client.List(context.TODO(), &deploys,
+		&client.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labels.Set{"l6p-app": KunUI}),
+			Namespace:     install.Namespace,
+		},
+	); err != nil {
+		e.Logger.Error(err, "failed to get Deployments")
+		return
 	}
 
 	// Ignore when the CRD is created before the operator's start time.
@@ -275,15 +157,7 @@ func (e EnqueueRequestForKunInstallation) Update(updateEvent event.UpdateEvent, 
 }
 
 func (e EnqueueRequestForKunInstallation) Delete(deleteEvent event.DeleteEvent, _ workqueue.RateLimitingInterface) {
-	// Delete the saved namespace when uninstalling CRD.
 	install := deleteEvent.Object.(*kunapi.KunInstallation)
-	tmp := make([]string, 0)
-	for _, namespace := range ServerNamespaces {
-		if namespace != install.Namespace {
-			tmp = append(tmp, namespace)
-		}
-	}
-	ServerNamespaces = tmp
 
 	if err := UndeployUI(e.Client, context.Background(), install.Namespace); err != nil {
 		e.Logger.Error(err, "failed to undeploy Kun UI")
@@ -302,17 +176,12 @@ func (e EnqueueRequestForKunInstallation) Generic(event.GenericEvent, workqueue.
 // SetupWithManager sets up the controller with the Manager.
 func (r *KunInstallationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	logger := logf.Log.WithName("kuninstallation-controller")
-	go PodEventProcessor(logger)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kunapi.KunInstallation{}).
 		Watches(
 			&source.Kind{Type: &kunapi.KunInstallation{}},
 			&EnqueueRequestForKunInstallation{Logger: logger, Client: r.Client},
-		).
-		Watches(
-			&source.Kind{Type: &core.Pod{}},
-			&EnqueueRequestForPod{Logger: logger},
 		).
 		Complete(r)
 }
@@ -324,10 +193,11 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 		return err
 	}
 
-	ServerImage = path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunApi))
 	if err := CreateDeployment(
 		c, ctx, KunApi, install.Namespace, ServerDeployTemplate,
-		install.Spec.Server.Replicas, ServerImage, &install.Spec.Server.Resources,
+		install.Spec.Server.Replicas,
+		path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunApi)),
+		&install.Spec.Server.Resources,
 		[]core.EnvVar{
 			{
 				Name:  "MONGODB_ADDR",
@@ -394,10 +264,12 @@ func DeployUI(c client.Client, ctx context.Context, install *kunapi.KunInstallat
 		return err
 	}
 
-	UIImage = path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunUI))
 	if err := CreateDeployment(
 		c, ctx, KunUI, install.Namespace, UIDeployTemplate,
-		install.Spec.UI.Replicas, UIImage, &install.Spec.UI.Resources, nil,
+		install.Spec.UI.Replicas,
+		path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunUI)),
+		&install.Spec.UI.Resources,
+		nil,
 	); err != nil {
 		return err
 	}
