@@ -26,7 +26,6 @@ import (
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -109,17 +108,6 @@ type EnqueueRequestForKunInstallation struct {
 
 func (e EnqueueRequestForKunInstallation) Create(createEvent event.CreateEvent, _ workqueue.RateLimitingInterface) {
 	install := createEvent.Object.(*kunapi.KunInstallation)
-
-	var deploys apps.DeploymentList
-	if err := e.Client.List(context.TODO(), &deploys,
-		&client.ListOptions{
-			LabelSelector: labels.SelectorFromSet(labels.Set{"l6p-app": KunUI}),
-			Namespace:     install.Namespace,
-		},
-	); err != nil {
-		e.Logger.Error(err, "failed to get Deployments")
-		return
-	}
 
 	// Ignore when the CRD is created before the operator's start time.
 	if StartTime.After(install.CreationTimestamp.Time) {
