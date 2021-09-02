@@ -36,10 +36,6 @@ spec:
           spec:
             description: KunInstallationSpec defines the desired state of KunInstallation
             properties:
-              hub:
-                description: 'INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-                  Important: Run "make" to regenerate code after modifying this file'
-                type: string
               mongodb:
                 properties:
                   addr:
@@ -47,6 +43,24 @@ spec:
                   pass:
                     type: string
                   user:
+                    type: string
+                type: object
+              registry:
+                description: 'INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
+                  Important: Run "make" to regenerate code after modifying this file'
+                properties:
+                  auth:
+                    items:
+                      properties:
+                        authority:
+                          type: string
+                        password:
+                          type: string
+                        username:
+                          type: string
+                      type: object
+                    type: array
+                  hub:
                     type: string
                 type: object
               server:

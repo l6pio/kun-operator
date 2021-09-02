@@ -28,10 +28,21 @@ import (
 type KunInstallationSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Hub     string                 `json:"hub,omitempty"`
-	Mongodb KunInstallationMongodb `json:"mongodb,omitempty"`
-	Server  KunInstallationServer  `json:"server,omitempty"`
-	UI      KunInstallationUI      `json:"ui,omitempty"`
+	Registry KunInstallationRegistry `json:"registry,omitempty"`
+	Mongodb  KunInstallationMongodb  `json:"mongodb,omitempty"`
+	Server   KunInstallationServer   `json:"server,omitempty"`
+	UI       KunInstallationUI       `json:"ui,omitempty"`
+}
+
+type KunInstallationRegistry struct {
+	Hub  string                        `json:"hub,omitempty" yaml:"hub,omitempty"`
+	Auth []KunInstallationRegistryAuth `json:"auth,omitempty" yaml:"auth,omitempty"`
+}
+
+type KunInstallationRegistryAuth struct {
+	Authority string `json:"authority,omitempty" yaml:"authority,omitempty"`
+	Username  string `json:"username,omitempty" yaml:"username,omitempty"`
+	Password  string `json:"password,omitempty" yaml:"password,omitempty"`
 }
 
 type KunInstallationMongodb struct {

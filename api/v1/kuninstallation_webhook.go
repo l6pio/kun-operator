@@ -45,8 +45,8 @@ var _ webhook.Defaulter = &KunInstallation{}
 func (r *KunInstallation) Default() {
 	kunlog.Info("default", "name", r.Name)
 
-	if r.Spec.Hub == "" {
-		r.Spec.Hub = "docker.io/l6pio"
+	if r.Spec.Registry.Hub == "" {
+		r.Spec.Registry.Hub = "docker.io/l6pio"
 	}
 
 	if r.Spec.Server.Replicas == nil {

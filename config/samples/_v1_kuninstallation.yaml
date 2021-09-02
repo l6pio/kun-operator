@@ -3,7 +3,12 @@ kind: KunInstallation
 metadata:
   name: sample
 spec:
-  hub: localhost:32000
+  registry:
+    hub: localhost:32000
+    auth:
+      - authority: registry.l6p.io
+        username: username
+        password: password
   mongodb:
     addr: "mongodb.default.svc.cluster.local:27017"
     user: "root"

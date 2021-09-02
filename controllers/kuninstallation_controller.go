@@ -19,8 +19,10 @@ package controllers
 import (
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"github.com/go-logr/logr"
+	"gopkg.in/yaml.v3"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
@@ -46,6 +48,9 @@ const KunUI = "kun-ui"
 
 //go:embed templates/server/service-account.yaml
 var ServerServiceAccountTemplate string
+
+//go:embed templates/server/configmap.yaml
+var ServerConfigMapTemplate string
 
 //go:embed templates/server/deployment.yaml
 var ServerDeployTemplate string
@@ -79,6 +84,7 @@ type KunInstallationReconciler struct {
 //+kubebuilder:rbac:groups=l6p.io,resources=kuninstallations/finalizers,verbs=update
 
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="networking.k8s.io",resources=ingresses,verbs=get;list;watch;create;update;patch;delete
@@ -193,10 +199,16 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 		return err
 	}
 
+	if err := CreateConfigMap(
+		c, ctx, KunApi, install, ServerConfigMapTemplate,
+	); err != nil {
+		return err
+	}
+
 	if err := CreateDeployment(
 		c, ctx, KunApi, install.Namespace, ServerDeployTemplate,
 		install.Spec.Server.Replicas,
-		path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunApi)),
+		path.Join(install.Spec.Registry.Hub, fmt.Sprintf("%s:latest", KunApi)),
 		&install.Spec.Server.Resources,
 		[]core.EnvVar{
 			{
@@ -235,11 +247,7 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 }
 
 func UndeployServer(c client.Client, ctx context.Context, namespace string) error {
-	if err := DeleteServiceAccount(c, ctx, KunApi, namespace); err != nil {
-		return err
-	}
-
-	if err := DeleteDeployment(c, ctx, KunApi, namespace); err != nil {
+	if err := DeleteIngress(c, ctx, KunApi, namespace); err != nil {
 		return err
 	}
 
@@ -247,7 +255,15 @@ func UndeployServer(c client.Client, ctx context.Context, namespace string) erro
 		return err
 	}
 
-	if err := DeleteIngress(c, ctx, KunApi, namespace); err != nil {
+	if err := DeleteDeployment(c, ctx, KunApi, namespace); err != nil {
+		return err
+	}
+
+	if err := DeleteConfigMap(c, ctx, KunApi, namespace); err != nil {
+		return err
+	}
+
+	if err := DeleteServiceAccount(c, ctx, KunApi, namespace); err != nil {
 		return err
 	}
 	return nil
@@ -267,7 +283,7 @@ func DeployUI(c client.Client, ctx context.Context, install *kunapi.KunInstallat
 	if err := CreateDeployment(
 		c, ctx, KunUI, install.Namespace, UIDeployTemplate,
 		install.Spec.UI.Replicas,
-		path.Join(install.Spec.Hub, fmt.Sprintf("%s:latest", KunUI)),
+		path.Join(install.Spec.Registry.Hub, fmt.Sprintf("%s:latest", KunUI)),
 		&install.Spec.UI.Resources,
 		nil,
 	); err != nil {
@@ -293,11 +309,7 @@ func DeployUI(c client.Client, ctx context.Context, install *kunapi.KunInstallat
 }
 
 func UndeployUI(c client.Client, ctx context.Context, namespace string) error {
-	if err := DeleteServiceAccount(c, ctx, KunUI, namespace); err != nil {
-		return err
-	}
-
-	if err := DeleteDeployment(c, ctx, KunUI, namespace); err != nil {
+	if err := DeleteIngress(c, ctx, KunUI, namespace); err != nil {
 		return err
 	}
 
@@ -305,7 +317,11 @@ func UndeployUI(c client.Client, ctx context.Context, namespace string) error {
 		return err
 	}
 
-	if err := DeleteIngress(c, ctx, KunUI, namespace); err != nil {
+	if err := DeleteDeployment(c, ctx, KunUI, namespace); err != nil {
+		return err
+	}
+
+	if err := DeleteServiceAccount(c, ctx, KunUI, namespace); err != nil {
 		return err
 	}
 	return nil
@@ -338,12 +354,10 @@ func CreateServiceAccount(c client.Client, ctx context.Context, name string, nam
 		if err := runtime.DecodeInto(decoder, []byte(template), &newServiceAccount); err != nil {
 			return err
 		}
+
 		newServiceAccount.Name = name
 		newServiceAccount.Namespace = namespace
-
-		if err := c.Create(ctx, &newServiceAccount); err != nil {
-			return err
-		}
+		return c.Create(ctx, &newServiceAccount)
 	}
 	return nil
 }
@@ -354,6 +368,61 @@ func DeleteServiceAccount(c client.Client, ctx context.Context, name string, nam
 		return err
 	} else if serviceAccount != nil {
 		if err := c.Delete(ctx, serviceAccount); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func GetConfigMap(c client.Client, ctx context.Context, name string, namespace string) (*core.ConfigMap, error) {
+	var configMaps core.ConfigMapList
+	if err := c.List(ctx, &configMaps, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+
+	if len(configMaps.Items) > 0 {
+		for _, cm := range configMaps.Items {
+			if cm.Name == name {
+				return &cm, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func CreateConfigMap(c client.Client, ctx context.Context, name string, install *kunapi.KunInstallation, template string) error {
+	configMap, err := GetConfigMap(c, ctx, name, install.Namespace)
+	if err != nil {
+		return err
+	} else if configMap == nil {
+		decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDecoder()
+
+		var newConfigMap core.ConfigMap
+		if err := runtime.DecodeInto(decoder, []byte(template), &newConfigMap); err != nil {
+			return err
+		}
+
+		bytes, err := yaml.Marshal(install.Spec.Registry)
+		if err != nil {
+			return err
+		}
+
+		newConfigMap.Name = name
+		newConfigMap.Namespace = install.Namespace
+		newConfigMap.Data = map[string]string{
+			"registry": base64.StdEncoding.EncodeToString(bytes),
+		}
+		return c.Create(ctx, &newConfigMap)
+	}
+	return nil
+}
+
+func DeleteConfigMap(c client.Client, ctx context.Context, name string, namespace string) error {
+	configMap, err := GetConfigMap(c, ctx, name, namespace)
+	if err != nil {
+		return err
+	} else if configMap != nil {
+		if err := c.Delete(ctx, configMap); err != nil {
 			return err
 		}
 	}
@@ -404,9 +473,7 @@ func CreateDeployment(
 			container.Env = env
 		}
 
-		if err := c.Create(ctx, &newDeploy); err != nil {
-			return err
-		}
+		return c.Create(ctx, &newDeploy)
 	}
 	return nil
 }
@@ -453,13 +520,11 @@ func CreateService(
 		if err := runtime.DecodeInto(decoder, []byte(template), &newService); err != nil {
 			return err
 		}
+
 		newService.Name = name
 		newService.Namespace = namespace
 		newService.Spec.Ports[0].Port = port
-
-		if err := c.Create(ctx, &newService); err != nil {
-			return err
-		}
+		return c.Create(ctx, &newService)
 	}
 	return nil
 }
@@ -533,9 +598,7 @@ func CreateIngress(
 				},
 			},
 		}
-		if err := c.Create(ctx, &newIngress); err != nil {
-			return err
-		}
+		return c.Create(ctx, &newIngress)
 	}
 	return nil
 }
