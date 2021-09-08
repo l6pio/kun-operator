@@ -26,6 +26,7 @@ import (
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
+	v1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -48,6 +49,12 @@ const KunUI = "kun-ui"
 
 //go:embed templates/server/service-account.yaml
 var ServerServiceAccountTemplate string
+
+//go:embed templates/server/cluster-role.yaml
+var ServerClusterRoleTemplate string
+
+//go:embed templates/server/cluster-role-binding.yaml
+var ServerClusterRoleBindingTemplate string
 
 //go:embed templates/server/configmap.yaml
 var ServerConfigMapTemplate string
@@ -86,8 +93,11 @@ type KunInstallationReconciler struct {
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="networking.k8s.io",resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -188,6 +198,18 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 		return err
 	}
 
+	if err := CreateClusterRole(
+		c, ctx, KunApi, ServerClusterRoleTemplate,
+	); err != nil {
+		return err
+	}
+
+	if err := CreateClusterRoleBinding(
+		c, ctx, KunApi, install.Namespace, ServerClusterRoleBindingTemplate,
+	); err != nil {
+		return err
+	}
+
 	if err := CreateConfigMap(
 		c, ctx, KunApi, install, ServerConfigMapTemplate,
 	); err != nil {
@@ -255,6 +277,14 @@ func UndeployServer(c client.Client, ctx context.Context, namespace string) erro
 	}
 
 	if err := DeleteDeployment(c, ctx, KunApi, namespace); err != nil {
+		return err
+	}
+
+	if err := DeleteClusterRole(c, ctx, KunApi); err != nil {
+		return err
+	}
+
+	if err := DeleteClusterRoleBinding(c, ctx, KunApi); err != nil {
 		return err
 	}
 
@@ -373,6 +403,103 @@ func DeleteServiceAccount(c client.Client, ctx context.Context, name string, nam
 	return nil
 }
 
+func GetClusterRole(c client.Client, ctx context.Context, name string) (*v1.ClusterRole, error) {
+	var roles v1.ClusterRoleList
+	if err := c.List(ctx, &roles); err != nil {
+		return nil, err
+	}
+
+	if len(roles.Items) > 0 {
+		for _, role := range roles.Items {
+			if role.Name == name {
+				return &role, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func CreateClusterRole(c client.Client, ctx context.Context, name string, template string) error {
+	var role, err = GetClusterRole(c, ctx, name)
+	if err != nil {
+		return err
+	} else if role == nil {
+		decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDecoder()
+
+		role = new(v1.ClusterRole)
+		if err := runtime.DecodeInto(decoder, []byte(template), role); err != nil {
+			return err
+		}
+		role.Name = name
+
+		if err := c.Create(ctx, role); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func DeleteClusterRole(c client.Client, ctx context.Context, name string) error {
+	role, err := GetClusterRole(c, ctx, name)
+	if err != nil {
+		return err
+	} else if role != nil {
+		if err := c.Delete(ctx, role); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func GetClusterRoleBinding(c client.Client, ctx context.Context, name string) (*v1.ClusterRoleBinding, error) {
+	var roleBindings v1.ClusterRoleBindingList
+	if err := c.List(ctx, &roleBindings); err != nil {
+		return nil, err
+	}
+
+	if len(roleBindings.Items) > 0 {
+		for _, roleBinding := range roleBindings.Items {
+			if roleBinding.Name == name {
+				return &roleBinding, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func CreateClusterRoleBinding(c client.Client, ctx context.Context, name string, namespace string, template string) error {
+	var roleBinding, err = GetClusterRoleBinding(c, ctx, name)
+	if err != nil {
+		return err
+	} else if roleBinding == nil {
+		decoder := serializer.NewCodecFactory(scheme.Scheme).UniversalDecoder()
+
+		roleBinding = new(v1.ClusterRoleBinding)
+		if err := runtime.DecodeInto(decoder, []byte(template), roleBinding); err != nil {
+			return err
+		}
+		roleBinding.Name = name
+		roleBinding.Subjects[0].Namespace = namespace
+
+		if err := c.Create(ctx, roleBinding); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func DeleteClusterRoleBinding(c client.Client, ctx context.Context, name string) error {
+	roleBinding, err := GetClusterRoleBinding(c, ctx, name)
+	if err != nil {
+		return err
+	} else if roleBinding != nil {
+		if err := c.Delete(ctx, roleBinding); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func GetConfigMap(c client.Client, ctx context.Context, name string, namespace string) (*core.ConfigMap, error) {
 	var configMaps core.ConfigMapList
 	if err := c.List(ctx, &configMaps, client.InNamespace(namespace)); err != nil {
@@ -463,6 +590,7 @@ func CreateDeployment(
 		newDeploy.Name = name
 		newDeploy.Namespace = namespace
 		newDeploy.Spec.Replicas = replicas
+		newDeploy.Spec.Template.Spec.ServiceAccountName = KunApi
 
 		container := &newDeploy.Spec.Template.Spec.Containers[0]
 		container.Image = image
