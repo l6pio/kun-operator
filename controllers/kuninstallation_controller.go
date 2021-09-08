@@ -41,6 +41,7 @@ import (
 )
 
 var StartTime = time.Now()
+var TrueValue = true
 
 const KunApi = "kun-api"
 const KunUI = "kun-ui"
@@ -210,6 +211,16 @@ func DeployServer(c client.Client, ctx context.Context, install *kunapi.KunInsta
 			{
 				Name:  "MONGODB_PASS",
 				Value: install.Spec.Mongodb.Pass,
+			},
+			{
+				Name: "REGISTRY",
+				ValueFrom: &core.EnvVarSource{
+					ConfigMapKeyRef: &core.ConfigMapKeySelector{
+						LocalObjectReference: core.LocalObjectReference{Name: "kun-api"},
+						Key:                  "registry",
+						Optional:             &TrueValue,
+					},
+				},
 			},
 		},
 	); err != nil {
